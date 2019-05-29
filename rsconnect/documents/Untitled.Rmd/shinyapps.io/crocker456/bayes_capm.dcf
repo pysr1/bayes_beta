@@ -1,0 +1,12 @@
+name: bayes_capm
+title: bayes_capm
+username:
+account: crocker456
+server: shinyapps.io
+hostUrl: https://api.shinyapps.io/v1
+appId: 788619
+bundleId: 1938397
+url: https://crocker456.shinyapps.io/bayes_capm/
+when: 1552532966.89466
+asMultiple: FALSE
+asStatic: FALSE

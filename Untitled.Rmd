@@ -1,0 +1,217 @@
+---
+title: "Capm Beta"
+runtime: shiny
+output:
+  flexdashboard::flex_dashboard:
+    orientation: rows
+    source_code: embed
+---
+
+
+```{r package import, message = FALSE}
+library(tidyverse)
+library(highcharter)
+library(tidyquant)
+library(timetk)
+library(scales)
+library(shiny)
+library(broom)
+library(rstanarm)
+library(highcharter)
+library(data.table)
+library(ggthemes)
+library(modelr)
+library(tidybayes)
+library(plotly)
+```
+
+Sidebar {.sidebar}
+=====================================
+  
+```{r, text boxes}
+
+fluidRow(
+  column(6,
+  textInput("stock1", "Stock 1", "FB")),
+  column(5,
+  numericInput("w1", "Portf. %", 25, min = 1, max = 100))
+)  
+
+fluidRow(
+  column(6,
+  textInput("stock2", "Stock 2", "AMZN")),
+  column(5,
+  numericInput("w2", "Portf. %", 25, min = 1, max = 100))
+)
+
+fluidRow(
+  column(6,
+  textInput("stock3", "Stock 3", "AAPL")),
+  column(5,
+  numericInput("w3", "Portf. %", 20, min = 1, max = 100))
+)
+
+fluidRow(
+  column(6,
+  textInput("stock4", "Stock 4", "NFLX")),
+  column(5,
+  numericInput("w4", "Portf. %", 20, min = 1, max = 100))
+)
+
+fluidRow(
+  column(6,
+  textInput("stock5", "Stock 5", "GOOGL")),
+  column(5,
+  numericInput("w5", "Portf. %", 10, min = 1, max = 100))
+)
+
+fluidRow(
+  column(7,
+  dateInput("date", "Starting Date", "2018-01-01", format = "yyyy-mm-dd"))
+)
+
+actionButton("go", "Submit")
+```
+
+
+```{r, data import and portfolio calculation}
+prices <- eventReactive(input$go, {
+  
+  symbols <- c(input$stock1, input$stock2, input$stock3, input$stock4, input$stock5)
+  
+  getSymbols(symbols, src = 'yahoo', from = input$date, 
+             auto.assign = TRUE, warnings = FALSE) %>% 
+  map(~Ad(get(.))) %>% 
+  reduce(merge) %>%
+  `colnames<-`(symbols)
+})
+
+
+market_return <- eventReactive(input$go, {
+  market_return <- 
+    getSymbols("SPY", src = 'yahoo', from = input$date, 
+             auto.assign = TRUE, warnings = FALSE) %>% 
+    map(~Ad(get(.))) %>% 
+    reduce(merge) %>%
+    `colnames<-`("SPY") %>% 
+    #to.monthly(indexAt = "lastof", OHLC = FALSE) %>% 
+    tk_tbl(preserve_index = TRUE, rename_index = "date") %>%
+    mutate(returns = (log(SPY) - log(lag(SPY)))) %>% 
+    na.omit() %>%
+    select(date, returns)
+})
+
+
+portfolio_returns_tq_rebalanced_monthly <- eventReactive(input$go, {
+  
+  prices <- prices()
+  w <- c(input$w1/100, input$w2/100, input$w3/100, input$w4/100, input$w5/100)
+  
+  portfolio_returns_tq_rebalanced_monthly <- 
+      prices %>% 
+      #to.monthly(indexAt = "lastof", OHLC = FALSE) %>% 
+      tk_tbl(preserve_index = TRUE, rename_index = "date") %>%
+      gather(asset, returns, -date) %>% 
+      group_by(asset) %>%  
+      mutate(returns = (log(returns) - log(lag(returns)))) %>% 
+      na.omit() %>%
+      tq_portfolio(assets_col  = asset, 
+               returns_col = returns,
+               weights     = w,
+               col_rename  = "returns",
+               rebalance_on = "months")
+  portfolio_returns_tq_rebalanced_monthly= portfolio_returns_tq_rebalanced_monthly %>% 
+  mutate(beta = market_return()$returns)
+})
+
+model_capm <- eventReactive(input$go, {
+  
+  portfolio_returns_tq_rebalanced_monthly <- portfolio_returns_tq_rebalanced_monthly()
+  
+  #market_return <- market_return()
+model_capm = stan_glm(returns ~ beta, data = portfolio_returns_tq_rebalanced_monthly, iter=1000)
+
+  
+})
+  
+
+
+```
+
+CAPM Bayesian Risk Managment 
+=====================================  
+
+Row {.tabset .tabset-fade}
+-------------------------------------
+
+### Posterior Distribution Of Beta
+
+```{r, confidence interval plot}
+
+renderPlotly({
+  
+  model = model_capm() %>% as_tibble()
+  
+  high = quantile(model$beta,  0.975)
+  
+  low = quantile(model$beta,  0.025)
+  mean = mean(model$beta)
+  #WVPlots::ShadedDensityCenter(model, "beta", boundaries, 
+  #                     title="95% Credible Interval on Beta") 
+  ggplotly(ggplot(model, aes(beta))+
+  geom_histogram(alpha=0.3)+
+  geom_errorbarh(width = 4,aes(y = 10, xmin=low, xmax=high, height = 25), color = 'black')+
+  labs('Posterior Distribution of Portfolio Beta', x = 'beta', y = 'count')+
+  theme_economist()
+ )
+  
+          })
+```
+
+
+### Model Fit
+
+```{r}
+renderPlot({
+ model =  model_capm()
+ portfolio_returns_tq_rebalanced_monthly = portfolio_returns_tq_rebalanced_monthly()
+ 
+ portfolio_returns_tq_rebalanced_monthly %>%
+  data_grid(beta = seq_range(beta, n = 50)) %>%
+  add_predicted_draws(model) %>%
+  ggplot(aes(x = beta, y = returns)) +
+  stat_lineribbon(aes(y = .prediction), .width = c(.95, .8), color = "#09545D") +
+  geom_point(data = portfolio_returns_tq_rebalanced_monthly, size = 2) +
+  scale_fill_brewer()+
+  labs('CAPM Bayesian GLM fit', x = 'Market Returns', y = 'Portfolio Returns')+
+  theme_classic()
+  
+ 
+          })
+```
+
+### Model R-squared
+```{r}
+renderHighchart({
+  r2_samples = bayes_R2(model_capm())
+  hchart(density(r2_samples), type = "area",  name = "model_R2") %>% 
+  hc_add_theme(hc_theme_economist())
+})
+
+```
+
+Row 2 {data-height=100}
+----------------------------------
+
+### Model Results
+
+```{r}
+renderTable({
+  model = model_capm() %>% as_tibble()
+   model %>% 
+  mutate(indicator_1= if_else(beta > 1, 1, 0), indicator_2 = if_else(beta < 1, 1, 0)) %>% 
+  summarise('Posterior mean Beta' = mean(beta), 'lower 95% credible interval'= quantile(beta, p=0.025), 'upper 95% credible interval'= quantile(beta, p=0.975),
+            'Probability More Volatile than Market' = sum(indicator_1)/ n(),
+            'Probability Less Volatile than Market' = sum(indicator_2)/ n())
+}, digits = 4)
+```

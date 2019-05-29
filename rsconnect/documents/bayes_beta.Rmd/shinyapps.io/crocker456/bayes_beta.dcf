@@ -1,0 +1,12 @@
+name: bayes_beta
+title: bayes_beta
+username:
+account: crocker456
+server: shinyapps.io
+hostUrl: https://api.shinyapps.io/v1
+appId: 955097
+bundleId: 2115840
+url: https://crocker456.shinyapps.io/bayes_beta/
+when: 1559136900.11851
+asMultiple: FALSE
+asStatic: FALSE

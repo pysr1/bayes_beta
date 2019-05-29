@@ -1,0 +1,204 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+
+```{r}
+### Package imports
+
+library(tidyquant)
+library(tidyverse)
+library(timetk)
+library(tibbletime)
+library(broom)
+
+# define a list of symbols 
+
+symbols <- c("SPY","EFA", "IJS", "EEM","AGG")
+
+# define a start data and end date 
+
+start = "2013-01-01"
+end = "2017-12-31"
+
+# Use the getSymbols function to obtain security prices
+
+prices <- 
+  getSymbols(symbols, src = 'yahoo', 
+             from = start,
+             #to = end,
+             auto.assign = TRUE, warnings = FALSE) %>% 
+  map(~Ad(get(.))) %>%
+  reduce(merge) %>% 
+  `colnames<-`(symbols)
+
+# convert prices to monthly frequency
+
+prices_monthly <- to.monthly(prices, indexAt = "last", OHLC = FALSE)
+
+# compute log returns - I typically prefer simple arithmatic but I'll stay consistent
+
+asset_returns_xts <- na.omit(Return.calculate(prices_monthly, method = "log"))
+
+# define a list of weights
+
+w <- c(0.25, 0.25, 0.20, 0.20, 0.10)
+
+# rebalance the returns to reflect portfolio weights
+
+portfolio_returns_xts_rebalanced_monthly <- 
+  Return.portfolio(asset_returns_xts, weights = w, rebalance_on = "months") %>%
+  `colnames<-`("returns") 
+
+# create a long matrix of returns
+
+asset_returns_long <-  
+  prices %>% 
+  to.monthly(indexAt = "last", OHLC = FALSE) %>% 
+  tk_tbl(preserve_index = TRUE, rename_index = "date") %>%
+  gather(asset, returns, -date) %>% 
+  group_by(asset) %>%  
+  mutate(returns = (log(returns) - log(lag(returns)))) %>% 
+  na.omit()
+
+# calculate aggregate returns 
+
+portfolio_returns_tq_rebalanced_monthly <- 
+  asset_returns_long %>%
+  tq_portfolio(assets_col  = asset, 
+               returns_col = returns,
+               weights     = w,
+               col_rename  = "returns",
+               rebalance_on = "months")
+```
+
+```{r}
+
+asset_returns_long
+```
+
+As expected the monthly returns don't ever exceed 10%
+
+```{r}
+library(ggthemes)
+# use ggplot to quickly plot the distribution of returns
+portfolio_returns_tq_rebalanced_monthly %>% ggplot(aes(returns))+
+  geom_histogram(bins=30)+ 
+  labs(title='Portfolio Returns', x='Observed Return', y='Count')+
+  theme_economist()
+```
+
+Visualizing monthly returns over time, there appears to more volatility in returns as of recently.
+
+```{r}
+# use ggplot to quickly plot the distribution of returns
+portfolio_returns_tq_rebalanced_monthly %>% ggplot(aes(date, returns))+
+  geom_line()+
+  labs(title='Historical Monthly Portfolio Returns', x='Observed Return', y='Count')+
+  theme_economist()
+
+```
+
+```{r}
+spy_monthly_xts <- 
+    getSymbols("SPY", 
+               src = 'yahoo', 
+               from = start, 
+               #to = "2017-12-31",
+             auto.assign = TRUE, 
+             warnings = FALSE) %>% 
+    map(~Ad(get(.))) %>% 
+    reduce(merge) %>%
+    `colnames<-`("SPY") %>% 
+    to.monthly(indexAt = "last", OHLC = FALSE)
+
+market_returns_xts <-
+  Return.calculate(spy_monthly_xts, method = "log") %>% 
+  na.omit()
+
+market_returns_tidy <-
+  market_returns_xts %>% 
+    tk_tbl(preserve_index = TRUE, rename_index = "date") %>% 
+    na.omit() %>%
+    select(date, returns = SPY)
+
+portfolio_returns_tq_rebalanced_monthly= portfolio_returns_tq_rebalanced_monthly %>% 
+  mutate(market_returns = market_returns_tidy$returns) 
+  
+
+portfolio_returns_tq_rebalanced_monthly 
+
+```
+
+
+```{r}
+beta_dplyr_byhand <-
+  portfolio_returns_tq_rebalanced_monthly %>%
+  
+  do(model = lm(returns ~ market_returns, data = .)) %>% 
+  tidy(model) %>% 
+  mutate(term = c("alpha", "beta"))
+beta_dplyr_byhand 
+```
+
+```{r}
+library(rstanarm)
+model = stan_glm(returns ~ market_returns, data = portfolio_returns_tq_rebalanced_monthly,
+                 prior = normal(1))
+model %>% as_tibble() %>% 
+mutate(indicator = if_else(market_returns > 1, 1, 0)) %>% summarise('Posterior Probability of Decreasing Volatility' = sum(indicator)/ n())
+```
+
+```{r}
+library(plotly)
+beta = model %>% as_data_frame() %>% rename(intercept = `(Intercept)`) %>% 
+  select(-sigma) 
+  
+
+boundaries = quantile(beta$market_returns, c(0.025, 0.975))
+WVPlots::ShadedDensityCenter(beta, "market_returns", boundaries, 
+                      title="95% Credible Interval on Beta")
+beta
+```
+
+
+```{r}
+library(modelr)
+library(tidybayes)
+portfolio_returns_tq_rebalanced_monthly %>%
+  data_grid(market_returns = seq_range(market_returns, n = 101)) %>%
+  add_predicted_draws(model) %>%
+  ggplot(aes(x = market_returns, y = returns)) +
+  stat_lineribbon(aes(y = .prediction), .width = c(.95, .8), color = "#08519C") +
+  geom_point(data = portfolio_returns_tq_rebalanced_monthly, size = 2) +
+  scale_fill_brewer()
+```
+
+
+```{r}
+component_contr_matrix_fun <- function(returns, w){
+# create covariance matrix
+covariance_matrix <- 
+  cov(returns)
+# calculate portfolio standard deviation
+sd_portfolio <- 
+  sqrt(t(w) %*% covariance_matrix %*% w)
+# calculate marginal contribution of each asset
+marginal_contribution <- 
+  w %*% covariance_matrix / sd_portfolio[1, 1]
+# multiply marginal by weights vecotr
+component_contribution <- 
+  marginal_contribution * w 
+# divide by total standard deviation to get percentages
+component_percentages <- 
+  component_contribution / sd_portfolio[1, 1] 
+
+component_percentages %>% 
+  as_tibble() %>% 
+  gather(asset, contribution)
+}
+
+component_contr_matrix_fun(asset_returns_long, w = w)
+```
+
